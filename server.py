@@ -56,6 +56,100 @@ async def render(request: Request):
     return Response(content=pdf_bytes, media_type="application/pdf")
 
 
+class ExtractImageRequest(BaseModel):
+    url: str
+    token: str
+    filename: str
+    page: Optional[int] = 0  # Which page to extract (0 = first/cover)
+    min_width: Optional[int] = 400  # Minimum image width to consider as site plan
+    min_height: Optional[int] = 300
+
+
+@app.post("/extract-image")
+async def extract_image(req: ExtractImageRequest, request: Request):
+    """Download a PDF and extract the largest image (site plan/render) as base64 PNG."""
+    verify_api_key(request)
+
+    try:
+        # Download file
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.get(
+                req.url,
+                headers={"Authorization": f"Bearer {req.token}"},
+                follow_redirects=True,
+            )
+            resp.raise_for_status()
+            file_bytes = resp.content
+
+        ext = req.filename.rsplit(".", 1)[-1].lower() if "." in req.filename else ""
+
+        if ext != "pdf":
+            raise HTTPException(status_code=400, detail="Only PDF files supported for image extraction")
+
+        import fitz  # PyMuPDF
+        import base64
+
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+
+        best_image = None
+        best_area = 0
+
+        # Search through pages for the largest image (likely the site plan)
+        max_pages = min(doc.page_count, 20)  # Check first 20 pages
+        for page_num in range(max_pages):
+            page = doc[page_num]
+            images = page.get_images(full=True)
+
+            for img_info in images:
+                xref = img_info[0]
+                try:
+                    pix = fitz.Pixmap(doc, xref)
+
+                    # Convert CMYK to RGB if needed
+                    if pix.n > 4:
+                        pix = fitz.Pixmap(fitz.csRGB, pix)
+
+                    width = pix.width
+                    height = pix.height
+                    area = width * height
+
+                    # Only consider images large enough to be a site plan
+                    if width >= req.min_width and height >= req.min_height and area > best_area:
+                        best_area = area
+                        best_image = pix.tobytes("png")
+                        best_page = page_num
+
+                except Exception:
+                    continue
+
+        doc.close()
+
+        if best_image is None:
+            # Fallback: render the first page as an image
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            page = doc[req.page]
+            mat = fitz.Matrix(2, 2)  # 2x zoom for better quality
+            pix = page.get_pixmap(matrix=mat)
+            best_image = pix.tobytes("png")
+            best_page = req.page
+            doc.close()
+
+        # Convert to base64
+        b64 = base64.b64encode(best_image).decode("utf-8")
+
+        return {
+            "filename": req.filename,
+            "page": best_page,
+            "image_size": len(best_image),
+            "base64": b64,
+        }
+
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Download failed: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Image extraction failed: {str(e)}")
+
+
 class ExtractRequest(BaseModel):
     url: str
     token: str
