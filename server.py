@@ -43,8 +43,8 @@ async def render(request: Request):
     if not html_content:
         raise HTTPException(status_code=400, detail="Empty HTML body")
 
-    if len(html_content) > 10 * 1024 * 1024:  # 10MB limit
-        raise HTTPException(status_code=413, detail="HTML body too large (max 10MB)")
+    if len(html_content) > 50 * 1024 * 1024:  # 50MB limit
+        raise HTTPException(status_code=413, detail="HTML body too large (max 50MB)")
 
     try:
         import weasyprint
@@ -134,14 +134,30 @@ async def extract_image(req: ExtractImageRequest, request: Request):
             best_page = req.page
             doc.close()
 
-        # Convert to base64
-        b64 = base64.b64encode(best_image).decode("utf-8")
+        # Resize if too large (max 1200px wide) to keep HTML under size limits
+        from PIL import Image
+        img = Image.open(io.BytesIO(best_image))
+        max_width = 1200
+        if img.width > max_width:
+            ratio = max_width / img.width
+            new_size = (max_width, int(img.height * ratio))
+            img = img.resize(new_size, Image.LANCZOS)
+
+        # Save as JPEG for smaller size (PNG site plans can be 5MB+)
+        buf = io.BytesIO()
+        if img.mode == "RGBA":
+            img = img.convert("RGB")
+        img.save(buf, format="JPEG", quality=85)
+        optimized = buf.getvalue()
+
+        b64 = base64.b64encode(optimized).decode("utf-8")
 
         return {
             "filename": req.filename,
             "page": best_page,
-            "image_size": len(best_image),
+            "image_size": len(optimized),
             "base64": b64,
+            "format": "jpeg",
         }
 
     except httpx.HTTPError as e:
