@@ -88,91 +88,89 @@ async def extract_image(req: ExtractImageRequest, request: Request):
 
         import fitz  # PyMuPDF
         import base64
+        import gc
         from PIL import Image as PILImage
 
         doc = fitz.open(stream=file_bytes, filetype="pdf")
 
-        best_image = None
-        best_score = 0
-        best_page = 0
+        # Memory-efficient strategy:
+        # 1. First pass: tiny thumbnails (72 DPI) to score pages by content
+        # 2. Second pass: render best-scoring page at higher quality
+        max_pages = min(doc.page_count, 15)  # Check max 15 pages
+        best_score = -999999
+        best_page_num = req.page
 
-        # Strategy: render each page as an image, score by:
-        # - Landscape orientation (site plans are wide)
-        # - Color variety (not mostly white/text)
-        # - Not on first 2 pages (usually cover/logo)
-        # - Not on last 2 pages (usually signature/back cover)
-        max_pages = min(doc.page_count, 30)
-        pages_to_check = list(range(max_pages))
-
-        # Prioritize middle pages (site plans usually in middle of presentations)
-        # Skip first 2 and last 2 pages from priority
-        for page_num in pages_to_check:
+        for page_num in range(max_pages):
             try:
                 page = doc[page_num]
                 rect = page.rect
-                page_width = rect.width
-                page_height = rect.height
 
-                # Render at lower DPI first for scoring (fast)
-                mat = fitz.Matrix(1.5, 1.5)
-                pix = page.get_pixmap(matrix=mat)
-                img_bytes = pix.tobytes("png")
-                pil_img = PILImage.open(io.BytesIO(img_bytes))
+                # Low DPI thumbnail for scoring (100px wide max)
+                scale = min(100 / rect.width, 100 / rect.height)
+                mat = fitz.Matrix(scale, scale)
+                pix = page.get_pixmap(matrix=mat, alpha=False)
 
-                # Score this page
                 score = 0
 
-                # Landscape orientation bonus (site plans are landscape)
-                if page_width > page_height:
+                # Landscape bonus
+                if rect.width > rect.height:
                     score += 1000
-                else:
-                    score += 100
 
-                # Skip very first and very last pages (usually cover/signature)
-                if page_num == 0 or page_num >= max_pages - 1:
+                # Skip first 2 pages (cover/logo) and last page (back/signature)
+                if page_num < 2:
+                    score -= 2000
+                if page_num >= max_pages - 1:
                     score -= 500
 
-                # Color variety check — site plans have lots of colors
-                # Convert to small thumbnail for fast analysis
-                thumb = pil_img.copy()
-                thumb.thumbnail((100, 100))
-                if thumb.mode != "RGB":
-                    thumb = thumb.convert("RGB")
-                colors = thumb.getcolors(maxcolors=10000)
+                # Convert to PIL and check color variety
+                thumb_bytes = pix.tobytes("ppm")
+                pil_thumb = PILImage.open(io.BytesIO(thumb_bytes))
+                if pil_thumb.mode != "RGB":
+                    pil_thumb = pil_thumb.convert("RGB")
+
+                colors = pil_thumb.getcolors(maxcolors=5000)
                 if colors:
                     unique_colors = len(colors)
                     score += min(unique_colors * 2, 2000)
 
-                    # Check if page is mostly white (low content = logo/text page)
-                    white_pixels = sum(count for count, color in colors if sum(color) > 700)
-                    total_pixels = sum(count for count, color in colors)
-                    if total_pixels > 0:
-                        white_ratio = white_pixels / total_pixels
-                        if white_ratio > 0.8:  # >80% white = probably not site plan
-                            score -= 1500
-
-                # Size of image itself — prefer larger (more detail)
-                score += min(len(img_bytes) // 10000, 500)
+                    total = sum(c for c, _ in colors)
+                    white = sum(c for c, color in colors if sum(color) > 700)
+                    if total > 0:
+                        white_ratio = white / total
+                        if white_ratio > 0.85:
+                            score -= 2000
 
                 if score > best_score:
                     best_score = score
-                    best_image = img_bytes
-                    best_page = page_num
+                    best_page_num = page_num
 
-            except Exception as e:
+                # Release memory
+                pix = None
+                pil_thumb = None
+                thumb_bytes = None
+                gc.collect()
+
+            except Exception:
                 continue
 
-        doc.close()
-
-        if best_image is None:
-            # Fallback: render the first page
-            doc = fitz.open(stream=file_bytes, filetype="pdf")
-            page = doc[req.page]
-            mat = fitz.Matrix(2, 2)
-            pix = page.get_pixmap(matrix=mat)
+        # Now render the best page at good quality (not too high — 1.5x)
+        try:
+            page = doc[best_page_num]
+            mat = fitz.Matrix(1.5, 1.5)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
             best_image = pix.tobytes("png")
-            best_page = req.page
-            doc.close()
+            best_page = best_page_num
+            pix = None
+        except Exception:
+            # Ultimate fallback — render page 0 at low quality
+            page = doc[0]
+            mat = fitz.Matrix(1, 1)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            best_image = pix.tobytes("png")
+            best_page = 0
+
+        doc.close()
+        gc.collect()
 
         # Resize if too large (max 1200px wide) to keep HTML under size limits
         from PIL import Image
