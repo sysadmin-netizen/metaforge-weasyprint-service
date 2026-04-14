@@ -15,6 +15,7 @@ from typing import Optional
 app = FastAPI(title="MetaForge Document Service", docs_url=None, redoc_url=None)
 
 API_KEY = os.environ.get("WEASYPRINT_API_KEY", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 START_TIME = time.time()
 
 
@@ -56,18 +57,160 @@ async def render(request: Request):
     return Response(content=pdf_bytes, media_type="application/pdf")
 
 
+async def select_page_with_claude(
+    thumbnails: list[tuple[int, str]],  # [(page_num, base64_png), ...]
+    api_key: str,
+) -> int | None:
+    """Use Claude Vision to pick the best architectural render page."""
+    content = [
+        {
+            "type": "text",
+            "text": (
+                "Select the best page to use as a \"Site Plan\" image in a professional "
+                "construction contract document.\n\n"
+                "Pick a page showing:\n"
+                "- A clean 3D architectural render of a house/villa exterior (photorealistic)\n"
+                "- An aerial/bird's eye render showing the full property with landscaping\n"
+                "- A perspective view of the villa with trees, driveway, garden\n"
+                "- No dimension lines, no room labels, no measurement annotations\n\n"
+                "Do NOT pick:\n"
+                "- Floor plans with dimensions/measurements/room labels\n"
+                "- Elevation drawings with annotations\n"
+                "- BOQ tables, pricing tables, or text-heavy pages\n"
+                "- Scope summary pages with tables/grids\n"
+                "- Title/cover pages with just text or logos\n"
+                "- Material/mood boards with multiple small images\n"
+                "- Site photos (real photos, not renders)\n\n"
+                "Below are the pages. Each is labeled with its page number.\n"
+            ),
+        }
+    ]
+
+    for page_num, b64 in thumbnails:
+        content.append({"type": "text", "text": f"Page {page_num}:"})
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": b64},
+        })
+
+    content.append({
+        "type": "text",
+        "text": (
+            "\nRespond with ONLY the page number (0-indexed integer) of the best "
+            "3D architectural render. If none of the pages contain a suitable "
+            "render image, respond with -1.\n\nExample: 10"
+        ),
+    })
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-sonnet-4-20250514",
+                    "max_tokens": 32,
+                    "temperature": 0,
+                    "messages": [{"role": "user", "content": content}],
+                },
+            )
+            resp.raise_for_status()
+
+        data = resp.json()
+        answer = data["content"][0]["text"].strip()
+        page_num = int(answer)
+        print(f"[Claude Vision] Selected page {page_num}")
+        return page_num if page_num >= 0 else None
+    except Exception as e:
+        print(f"[Claude Vision] Failed: {e}")
+        return None
+
+
+def score_pages_heuristic(doc, max_pages: int, default_page: int = 0) -> int:
+    """Fallback heuristic scorer — keyword + color analysis."""
+    import gc
+    from PIL import Image as PILImage
+
+    PLAN_KEYWORDS = [
+        "floor plan", "site plan", "ground floor", "first floor",
+        "second floor", "roof plan", "layout plan", "proposed plan",
+        "elevation", "landscape plan", "master plan",
+    ]
+    BOQ_KEYWORDS = [
+        "bill of quantities", "boq description", "material type",
+        "drawing reference", "number of items", "unit rate",
+    ]
+
+    best_score = -999999
+    best_page = default_page
+
+    for page_num in range(max_pages):
+        try:
+            page = doc[page_num]
+            rect = page.rect
+            scale = min(100 / rect.width, 100 / rect.height)
+            pix = page.get_pixmap(matrix=__import__("fitz").Matrix(scale, scale), alpha=False)
+            score = 0
+
+            if rect.width > rect.height:
+                score += 1000
+
+            try:
+                page_text = page.get_text("text").lower()[:2000]
+            except Exception:
+                page_text = ""
+
+            plan_hits = sum(1 for kw in PLAN_KEYWORDS if kw in page_text)
+            boq_hits = sum(1 for kw in BOQ_KEYWORDS if kw in page_text)
+            if plan_hits > 0:
+                score += 5000 + plan_hits * 500
+            if boq_hits > 0:
+                score -= 4000 + boq_hits * 300
+            if max_pages > 4:
+                if page_num == 0 and plan_hits == 0:
+                    score -= 500
+                if page_num >= max_pages - 1:
+                    score -= 500
+
+            thumb_bytes = pix.tobytes("ppm")
+            pil_thumb = PILImage.open(io.BytesIO(thumb_bytes)).convert("RGB")
+            colors = pil_thumb.getcolors(maxcolors=5000)
+            if colors:
+                score += min(len(colors), 1500)
+                total = sum(c for c, _ in colors)
+                white = sum(c for c, color in colors if sum(color) > 700)
+                if total > 0 and white / total > 0.90:
+                    score -= 2000
+
+            if score > best_score:
+                best_score = score
+                best_page = page_num
+
+            pix = None
+            pil_thumb = None
+            gc.collect()
+        except Exception:
+            continue
+
+    return best_page
+
+
 class ExtractImageRequest(BaseModel):
     url: str
     token: str
     filename: str
-    page: Optional[int] = 0  # Which page to extract (0 = first/cover)
-    min_width: Optional[int] = 400  # Minimum image width to consider as site plan
+    page: Optional[int] = 0
+    min_width: Optional[int] = 400
     min_height: Optional[int] = 300
 
 
 @app.post("/extract-image")
 async def extract_image(req: ExtractImageRequest, request: Request):
-    """Download a PDF and extract the largest image (site plan/render) as base64 PNG."""
+    """Download a PDF and extract the best architectural render as site plan image."""
     verify_api_key(request)
 
     try:
@@ -86,74 +229,46 @@ async def extract_image(req: ExtractImageRequest, request: Request):
         if ext != "pdf":
             raise HTTPException(status_code=400, detail="Only PDF files supported for image extraction")
 
-        import fitz  # PyMuPDF
+        import fitz
         import base64
         import gc
         from PIL import Image as PILImage
 
         doc = fitz.open(stream=file_bytes, filetype="pdf")
+        max_pages = min(doc.page_count, 15)
 
-        # Memory-efficient strategy:
-        # 1. First pass: tiny thumbnails (72 DPI) to score pages by content
-        # 2. Second pass: render best-scoring page at higher quality
-        max_pages = min(doc.page_count, 15)  # Check max 15 pages
-        best_score = -999999
-        best_page_num = req.page
-
+        # Render all pages as 300px-wide thumbnails for Claude Vision
+        thumbnails: list[tuple[int, str]] = []
         for page_num in range(max_pages):
             try:
                 page = doc[page_num]
                 rect = page.rect
-
-                # Low DPI thumbnail for scoring (100px wide max)
-                scale = min(100 / rect.width, 100 / rect.height)
-                mat = fitz.Matrix(scale, scale)
-                pix = page.get_pixmap(matrix=mat, alpha=False)
-
-                score = 0
-
-                # Landscape bonus
-                if rect.width > rect.height:
-                    score += 1000
-
-                # Skip first 2 pages (cover/logo) and last page (back/signature)
-                if page_num < 2:
-                    score -= 2000
-                if page_num >= max_pages - 1:
-                    score -= 500
-
-                # Convert to PIL and check color variety
-                thumb_bytes = pix.tobytes("ppm")
-                pil_thumb = PILImage.open(io.BytesIO(thumb_bytes))
-                if pil_thumb.mode != "RGB":
-                    pil_thumb = pil_thumb.convert("RGB")
-
-                colors = pil_thumb.getcolors(maxcolors=5000)
-                if colors:
-                    unique_colors = len(colors)
-                    score += min(unique_colors * 2, 2000)
-
-                    total = sum(c for c, _ in colors)
-                    white = sum(c for c, color in colors if sum(color) > 700)
-                    if total > 0:
-                        white_ratio = white / total
-                        if white_ratio > 0.85:
-                            score -= 2000
-
-                if score > best_score:
-                    best_score = score
-                    best_page_num = page_num
-
-                # Release memory
+                scale = min(300 / rect.width, 300 / rect.height)
+                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                thumb_png = pix.tobytes("png")
+                thumb_b64 = base64.b64encode(thumb_png).decode("ascii")
+                thumbnails.append((page_num, thumb_b64))
                 pix = None
-                pil_thumb = None
-                thumb_bytes = None
-                gc.collect()
-
             except Exception:
                 continue
+        gc.collect()
 
-        # Now render the best page at good quality (not too high — 1.5x)
+        # Select best page — Claude Vision with heuristic fallback
+        best_page_num = req.page
+
+        if ANTHROPIC_API_KEY and len(thumbnails) > 1:
+            claude_pick = await select_page_with_claude(thumbnails, ANTHROPIC_API_KEY)
+            if claude_pick is not None and 0 <= claude_pick < max_pages:
+                best_page_num = claude_pick
+                print(f"[extract-image] Claude Vision selected page {best_page_num}")
+            else:
+                best_page_num = score_pages_heuristic(doc, max_pages, req.page)
+                print(f"[extract-image] Heuristic fallback selected page {best_page_num}")
+        else:
+            best_page_num = score_pages_heuristic(doc, max_pages, req.page)
+            print(f"[extract-image] Heuristic selected page {best_page_num} (no API key)")
+
+        # Render selected page at good quality (1.5x)
         try:
             page = doc[best_page_num]
             mat = fitz.Matrix(1.5, 1.5)
@@ -162,26 +277,22 @@ async def extract_image(req: ExtractImageRequest, request: Request):
             best_page = best_page_num
             pix = None
         except Exception:
-            # Ultimate fallback — render page 0 at low quality
             page = doc[0]
-            mat = fitz.Matrix(1, 1)
-            pix = page.get_pixmap(matrix=mat, alpha=False)
+            pix = page.get_pixmap(matrix=fitz.Matrix(1, 1), alpha=False)
             best_image = pix.tobytes("png")
             best_page = 0
 
         doc.close()
         gc.collect()
 
-        # Resize if too large (max 1200px wide) to keep HTML under size limits
+        # Resize if too large (max 1200px wide)
         from PIL import Image
         img = Image.open(io.BytesIO(best_image))
         max_width = 1200
         if img.width > max_width:
             ratio = max_width / img.width
-            new_size = (max_width, int(img.height * ratio))
-            img = img.resize(new_size, Image.LANCZOS)
+            img = img.resize((max_width, int(img.height * ratio)), Image.LANCZOS)
 
-        # Save as JPEG for smaller size (PNG site plans can be 5MB+)
         buf = io.BytesIO()
         if img.mode == "RGBA":
             img = img.convert("RGB")
