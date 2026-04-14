@@ -345,16 +345,64 @@ async def extract_text(req: ExtractRequest, request: Request):
 
         if ext == "pdf":
             try:
-                import fitz  # PyMuPDF — faster and more reliable than pdf-parse
+                import fitz  # PyMuPDF
                 doc = fitz.open(stream=file_bytes, filetype="pdf")
                 pages_text = []
-                for page_num in range(min(doc.page_count, 100)):  # Max 100 pages
+                for page_num in range(min(doc.page_count, 100)):
                     page = doc[page_num]
                     pages_text.append(f"--- Page {page_num + 1} ---\n{page.get_text()}")
                 extracted_text = "\n".join(pages_text)
+
+                # OCR fallback: if text extraction got almost nothing, the PDF is
+                # scanned/image-based (like Tatiana's contractor quotes). Use Claude
+                # Vision to read the pages. Cheap (~$0.03) and catches all the prices
+                # and descriptions that text extraction misses.
+                clean_text = extracted_text.replace("---", "").replace("Page", "").strip()
+                if len(clean_text) < 200 and ANTHROPIC_API_KEY and doc.page_count > 0:
+                    print(f"[extract-text] Scanned PDF detected ({len(clean_text)} chars). Using Claude Vision OCR...")
+                    import base64
+                    import gc
+                    content = [{"type": "text", "text": (
+                        "This is a scanned construction document. Extract ALL text exactly as printed. "
+                        "For each page, output the text preserving the structure (headers, line items, "
+                        "amounts, descriptions). Use ONLY printed text — ignore handwritten annotations, "
+                        "pencil marks, and margin notes. Preserve exact AED amounts as printed."
+                    )}]
+                    max_ocr_pages = min(doc.page_count, 10)
+                    for pg in range(max_ocr_pages):
+                        page = doc[pg]
+                        scale = min(1200 / page.rect.width, 1200 / page.rect.height)
+                        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                        png_b64 = base64.b64encode(pix.tobytes("png")).decode("ascii")
+                        content.append({"type": "text", "text": f"--- Page {pg + 1} ---"})
+                        content.append({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": png_b64}})
+                        pix = None
+                    gc.collect()
+
+                    try:
+                        async with httpx.AsyncClient(timeout=60.0) as ocr_client:
+                            ocr_resp = await ocr_client.post(
+                                "https://api.anthropic.com/v1/messages",
+                                headers={
+                                    "x-api-key": ANTHROPIC_API_KEY,
+                                    "anthropic-version": "2023-06-01",
+                                    "content-type": "application/json",
+                                },
+                                json={
+                                    "model": "claude-sonnet-4-20250514",
+                                    "max_tokens": 8192,
+                                    "temperature": 0,
+                                    "messages": [{"role": "user", "content": content}],
+                                },
+                            )
+                            ocr_data = ocr_resp.json()
+                            extracted_text = "[OCR via Claude Vision]\n" + ocr_data["content"][0]["text"]
+                            print(f"[extract-text] OCR extracted {len(extracted_text)} chars")
+                    except Exception as ocr_err:
+                        print(f"[extract-text] OCR failed: {ocr_err}, using minimal text extraction")
+
                 doc.close()
             except Exception:
-                # Fallback to pdfplumber
                 try:
                     import pdfplumber
                     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
